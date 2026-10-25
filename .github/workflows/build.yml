@@ -1,0 +1,68 @@
+name: Build RTL8188EAirport.kext
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Verify Kext (macOS 15 x86_64)
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream sources & verify firmware SHA-256
+        run: ./scripts/fetch-upstream.sh
+
+      - name: Run kernel lock balance linter
+        run: python3 ./scripts/lint-locks.py
+
+      - name: Build RTL8188EAirport.kext
+        run: make build
+
+      - name: Verify Mach-O kext binary & Info.plist
+        run: |
+          KEXT="src/driver/build-m4/RTL8188EAirport.kext"
+          plutil -lint "$KEXT/Contents/Info.plist"
+          file "$KEXT/Contents/MacOS/RTL8188EAirport" | grep -F "Mach-O 64-bit kext bundle x86_64"
+          codesign --verify --deep --strict "$KEXT"
+
+      - name: Package release archive
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            src/driver/build-m4/RTL8188EAirport.kext \
+            dist/RTL8188EAirport.kext.zip
+          shasum -a 256 dist/RTL8188EAirport.kext.zip > dist/RTL8188EAirport.kext.zip.sha256
+          cat dist/RTL8188EAirport.kext.zip.sha256
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RTL8188EAirport-kext
+          path: |
+            dist/RTL8188EAirport.kext.zip
+            dist/RTL8188EAirport.kext.zip.sha256
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.9.1' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'RTL8188EAirport v0.9.1 (macOS Sequoia)' }}
+          generate_release_notes: true
+          files: |
+            dist/RTL8188EAirport.kext.zip
+            dist/RTL8188EAirport.kext.zip.sha256

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>RTL8188EUM1</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.zekri.RTL8188EUM1</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>RTL8188EUM1</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.2.0</string>
+
+	<!--
+		Personality: adapter USB TP-Link RTL8188EUS (2357:010c)
+
+		WAJIB attach ke node INTERFACE (IOUSBHostInterface), bukan node device:
+		node device di stack USB modern diklaim driver internal Apple, sehingga
+		driver pihak ketiga tidak akan pernah match di sana.
+		Node interface punya properti idVendor/idProduct + bInterfaceNumber.
+	-->
+	<!--
+		Personality: adapter USB TP-Link RTL8188EUS (2357:010c)
+
+		Cuma SATU personality dipakai: node IOUSBHostDevice. Ini yang
+		proven match di mesin ini (lihat docs/milestone-m1.md).
+		Lebih dari satu personality = beberapa instance driver aktif
+		bersamaan = saling berebut chip.
+	-->
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RTL8188EUM1</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.zekri.RTL8188EUM1</string>
+			<key>IOClass</key>
+			<string>RTL8188EUM1</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<!-- 0x2357 = 9047, 0x010C = 268 -->
+			<key>idVendor</key>
+			<integer>9047</integer>
+			<key>idProduct</key>
+			<integer>268</integer>
+			<key>bInterfaceNumber</key>
+			<integer>0</integer>
+			<key>IOProbeScore</key>
+			<integer>92000</integer>
+			<!-- Mode driver: "full" (tulis register chip) atau "readonly" -->
+			<key>M1Mode</key>
+			<string>full</string>
+		</dict>
+		<key>RTL8188EUM1Device</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.zekri.RTL8188EUM1</string>
+			<key>IOClass</key>
+			<string>RTL8188EUM1</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostDevice</string>
+			<key>idVendor</key>
+			<integer>9047</integer>
+			<key>idProduct</key>
+			<integer>268</integer>
+			<key>IOProbeScore</key>
+			<integer>91000</integer>
+		</dict>
+	</dict>
+
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOUSBHostFamily</key>
+		<string>1.2</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>20.0.0</string>
+	</dict>
+</dict>
+</plist>

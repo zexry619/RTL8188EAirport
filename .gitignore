@@ -1,0 +1,44 @@
+# macOS system
+.DS_Store
+*.swp
+*~
+
+# Build artifacts & compiled output
+dist/
+build/
+build-*/
+*.o
+*.exp
+*.kext/
+*.dSYM/
+src/driver/build/
+src/driver/build-m4/
+src/build-test/
+src/build/
+src/m0-hello/build/
+
+# Compiled diagnostic binaries
+tools/rtwn_probe
+tools/usb_reset
+tools/t_diff
+tools/t_syn
+tools/t_usb
+tools/t_seq
+
+# Temporary logs & session handover files
+logs/
+*.log
+*-log.txt
+*.logarchive
+m1-log.txt
+CONTINUE.md
+
+# Development backups & archives
+backup/
+*.tar.gz
+*.bak
+
+# Unused upstream clones & external SDKs
+upstream/Airport_RTW88/
+upstream/AirPort-RTW/
+vendor/MacKernelSDK/
