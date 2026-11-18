@@ -103,6 +103,15 @@ bool ItlRtl8188E::init()
 	fBw40 = false;
 	fPriChLo = false;
 	memset(fTxScratch, 0, sizeof(fTxScratch));
+	memset(fCckTxPwr, 0, sizeof(fCckTxPwr));
+	memset(fHt40TxPwr, 0, sizeof(fHt40TxPwr));
+	fHt20OfdmDiff = 0;
+	fTxPwrValid = false;
+	fTxMcs = 7;
+	fRaTxCnt = fRaOkCnt = fRaRetryCnt = 0;
+	fRaSuccessStreak = 0;
+	fAvgRssi = -95;
+	fCurRxGain = 0x32;
 	return true;
 }
 
@@ -207,14 +216,21 @@ int ItlRtl8188E::initChip(void)
 	 * rtwn_seq_read_efuse_offload menulis 0xf4 ke register 0x209 (BCN_HEAD)
 	 * dan mereset MCU 8051 8 kali bila gagal.
 	 */
-	if (rtwn_seq_read_efuse_direct_8188e(&ef, halRead, halWrite,
-	    this) == 0 && ef.efuse_ok) {
+	bool efOk = (rtwn_seq_read_efuse_direct_8188e(&ef, halRead, halWrite,
+	    this) == 0 && ef.efuse_ok);
+	if (!efOk) {
+		efOk = (rtwn_seq_read_efuse_offload(&ef, halRead, halWrite,
+		    this) == 0 && ef.efuse_ok);
+	}
+	if (efOk) {
 		memcpy(res.mac, ef.mac, 6);
 		res.xtal = ef.xtal;
-	} else if (rtwn_seq_read_efuse_offload(&ef, halRead, halWrite, this) == 0 &&
-	    ef.efuse_ok) {
-		memcpy(res.mac, ef.mac, 6);
-		res.xtal = ef.xtal;
+		if (ef.txpwr_ok) {
+			memcpy(fCckTxPwr, ef.cck_tx_pwr, sizeof(fCckTxPwr));
+			memcpy(fHt40TxPwr, ef.ht40_tx_pwr, sizeof(fHt40TxPwr));
+			fHt20OfdmDiff = ef.ht20_ofdm_diff;
+			fTxPwrValid = true;
+		}
 	} else {
 		IOLog(LOGP "EFUSE gagal, pakai MAC default\n");
 		res.mac[0] = 0x02;
@@ -237,8 +253,12 @@ int ItlRtl8188E::initChip(void)
 	memcpy(fChip.macaddr, res.mac, 6);
 	fChip.xtal = res.xtal ? res.xtal : 0x20;
 
-	IOLog(LOGP "MAC %02x:%02x:%02x:%02x:%02x:%02x xtal=0x%02x\n",
-	    fMac[0], fMac[1], fMac[2], fMac[3], fMac[4], fMac[5], fChip.xtal);
+	IOLog(LOGP "MAC %02x:%02x:%02x:%02x:%02x:%02x xtal=0x%02x txpwr_ok=%d "
+	    "cck=%02x:%02x:%02x ht40=%02x:%02x:%02x diff=%02x\n",
+	    fMac[0], fMac[1], fMac[2], fMac[3], fMac[4], fMac[5], fChip.xtal,
+	    fTxPwrValid ? 1 : 0,
+	    fCckTxPwr[0], fCckTxPwr[2], fCckTxPwr[4],
+	    fHt40TxPwr[0], fHt40TxPwr[2], fHt40TxPwr[4], fHt20OfdmDiff);
 
 	rc += rtwn_init_mac_8188e(halRead, halWrite, this);
 	rc += rtwn_init_bb_8188e(halRead, halWrite, this, fChip.xtal);
@@ -422,6 +442,7 @@ bool ItlRtl8188E::attach(IOPCIDevice *device)
 	fRxRunning = true;
 	fChip.usb.setTxDoneCb(txDoneHook, this);
 	fChip.usb.setRxCallback(rxCb, this);
+	fChip.usb.setKickCb(kickCb, this);
 	if (!fChip.usb.bulkQueueRx(32)) {
 		IOLog(LOGP "gagal antre RX\n");
 		fRxRunning = false;
@@ -456,10 +477,20 @@ void ItlRtl8188E::detach(IOPCIDevice *device)
 {
 	(void)device;
 
+	/*
+	 * Simpan status attach net80211 SEBELUM flag dimatikan: ieee80211_ifdetach()
+	 * di bawah hanya boleh jalan bila interface memang ter-attach. fIfAttached
+	 * langsung dimatikan agar handleRx/rxTimerAction berhenti memanggil if_input.
+	 */
+	const bool wasIfAttached = fIfAttached;
+
 	/* 1. Hentikan sumber RX — jangan ada frame baru saat ifdetach. */
 	fRxRunning = false;
-	if (fAttached)
+	fIfAttached = false;
+	if (fAttached) {
 		fChip.usb.setRxCallback(nullptr, nullptr);
+		fChip.usb.setKickCb(nullptr, nullptr);
+	}
 	/*
 	 * Tutup pipe RX lebih dulu: bulkClose() melakukan abort sinkron,
 	 * jadi setelah ini tidak ada completion yang boleh menyentuh
@@ -499,7 +530,7 @@ void ItlRtl8188E::detach(IOPCIDevice *device)
 		fIc.ic_newstate = fOrigNewstate;
 		fOrigNewstate = nullptr;
 	}
-	if (fIfAttached && fIc.ic_if.if_snd.queue) {
+	if (wasIfAttached && fIc.ic_if.if_snd.queue) {
 		ieee80211_ifdetach(&fIc.ic_if);
 		fIfAttached = false;
 	}
@@ -610,13 +641,14 @@ void ItlRtl8188E::setDiag(const char *key, const char *value)
 
 void ItlRtl8188E::publishStats(void)
 {
-	char s[224];
+	char s[320];
 
 	snprintf(s, sizeof(s),
 	    "txm=%u txd=%u txe=%u txf=%u agg=%u rpt=%u txok=%u rty=%u "
 	    "rxm=%u rxd=%u rxe=%u bar=%u encf=%u pipe=%d inf=%d "
 	    "auth=%u/%u assoc=%u/%u try=%u rsnv=%u dlv=%u "
-	    "bw=%u st=%d xf=%08x sndq=%d",
+	    "bw=%u mcs=%u igi=%02x rssi=%d st=%d xf=%08x sndq=%d "
+	    "rxu=%d rxer=%u rec=%u lst=%08x",
 	    (unsigned)fTxMgmt, (unsigned)fTxData, (unsigned)fTxEapol,
 	    (unsigned)fTxFail, (unsigned)fTxAgg, (unsigned)fTxReport,
 	    (unsigned)fTxOk, (unsigned)fTxRetry, (unsigned)fRxMgmt,
@@ -628,8 +660,12 @@ void ItlRtl8188E::publishStats(void)
 	    (unsigned)fJoinTry, (unsigned)fRsnVariant,
 	    (unsigned)fRxDelivered,
 	    fBw40 ? 40u : 20u,
+	    (unsigned)fTxMcs, (unsigned)fCurRxGain, (int)fAvgRssi,
 	    (int)fIc.ic_state, (unsigned)fIc.ic_xflags,
-	    fIc.ic_if.if_snd.queue ? 1 : 0);
+	    fIc.ic_if.if_snd.queue ? 1 : 0,
+	    (int)fChip.usb.rxActive(), (unsigned)fChip.usb.rxErr(),
+	    (unsigned)fChip.usb.recoverCount(),
+	    (unsigned)fChip.usb.lastRxStatus());
 	setDiag("RTL8188E-stat", s);
 }
 
@@ -880,8 +916,10 @@ int ItlRtl8188E::newstateCb(struct ieee80211com *ic,
 		    R92C_RCR_APP_ICV | R92C_RCR_HTC_LOC_CTRL |
 		    R92C_RCR_APP_MIC | R92C_RCR_APP_PHYSTS;
 		halWrite(me, R92C_RCR, &rcr, 4);
-		if (!me->fScanning)
+		if (!me->fScanning) {
+			me->fCurRxGain = 0x20;
 			rtwn_set_rx_gain_8188e(halRead, halWrite, me, 0x20);
+		}
 
 		me->fScanning = true;
 		if (ic->ic_bss && ic->ic_bss->ni_chan)
@@ -933,6 +971,7 @@ int ItlRtl8188E::newstateCb(struct ieee80211com *ic,
 				    (unsigned)me->fJoinTry);
 			}
 			me->fJoinTry++;
+			me->fCurRxGain = 0x32;
 			rtwn_set_rx_gain_8188e(halRead, halWrite, me, 0x32);
 			me->updateSlot(ic);
 			me->applyRsnVariant(me->fJoinTry);
@@ -957,6 +996,13 @@ int ItlRtl8188E::newstateCb(struct ieee80211com *ic,
 		}
 		if (nstate == IEEE80211_S_RUN) {
 			me->fJoinTry = 0;
+			me->fCurRxGain = 0x32;
+			me->fTxMcs = 7;
+			me->fRaTxCnt = 0;
+			me->fRaOkCnt = 0;
+			me->fRaRetryCnt = 0;
+			me->fRaSuccessStreak = 0;
+			me->fAvgRssi = -95;
 			rtwn_set_rx_gain_8188e(halRead, halWrite, me, 0x32);
 			uint8_t msr = R92C_MSR_NETTYPE_INFRA;
 			me->updateSlot(ic);
@@ -982,7 +1028,7 @@ int ItlRtl8188E::newstateCb(struct ieee80211com *ic,
 			if (ic->ic_bss) {
 				uint16_t bcn_int = ic->ic_bss->ni_intval ? ic->ic_bss->ni_intval : 100;
 				halWrite(me, R92C_BCN_INTERVAL, &bcn_int, 2);
-				ic->ic_bss->ni_txmcs = 7;
+				ic->ic_bss->ni_txmcs = me->fTxMcs;
 			}
 		}
 		break;
@@ -1026,6 +1072,67 @@ void ItlRtl8188E::scanTimeoutCb(void *arg)
  * TX kita tidak punya antrean yang bisa macet, jadi cukup bersihkan
  * if_timer.
  */
+void ItlRtl8188E::updateRateAndGain(void)
+{
+	if (!fChipReady || fIc.ic_state != IEEE80211_S_RUN || !fIc.ic_bss)
+		return;
+
+	uint32_t txCnt = fRaTxCnt;
+	uint32_t okCnt = fRaOkCnt;
+	uint32_t rtyCnt = fRaRetryCnt;
+	fRaTxCnt = 0;
+	fRaOkCnt = 0;
+	fRaRetryCnt = 0;
+
+	if (txCnt >= 4) {
+		uint8_t prevMcs = fTxMcs;
+		uint32_t failCnt = (txCnt > okCnt) ? (txCnt - okCnt) : 0;
+		uint8_t minMcs = (failCnt * 2 > txCnt) ? 0 : 2;
+
+		if (failCnt * 3 > txCnt || rtyCnt > txCnt * 3) {
+			if (fTxMcs > minMcs)
+				fTxMcs--;
+			else if (fTxMcs < minMcs)
+				fTxMcs = minMcs;
+			fRaSuccessStreak = 0;
+		} else if (failCnt * 10 <= txCnt && rtyCnt <= txCnt) {
+			if (fTxMcs < 7) {
+				fRaSuccessStreak++;
+				if (fRaSuccessStreak >= 2 || txCnt >= 12) {
+					fTxMcs++;
+					fRaSuccessStreak = 0;
+				}
+			}
+		} else {
+			fRaSuccessStreak = 0;
+		}
+
+		if (fTxMcs != prevMcs) {
+			fIc.ic_bss->ni_txmcs = fTxMcs;
+		}
+	}
+
+	if (fAvgRssi > -95) {
+		uint8_t nextGain = fCurRxGain;
+
+		if (fAvgRssi <= -72) {
+			nextGain = 0x20;
+		} else if (fAvgRssi >= -56) {
+			nextGain = 0x32;
+		} else if (fAvgRssi >= -69 && fAvgRssi <= -59) {
+			nextGain = 0x26;
+		} else if (fCurRxGain != 0x20 && fCurRxGain != 0x26 &&
+		    fCurRxGain != 0x32) {
+			nextGain = (fAvgRssi < -64) ? 0x20 : 0x26;
+		}
+
+		if (nextGain != fCurRxGain) {
+			fCurRxGain = nextGain;
+			rtwn_set_rx_gain_8188e(halRead, halWrite, this, fCurRxGain);
+		}
+	}
+}
+
 void ItlRtl8188E::watchdogCb(struct _ifnet *ifp)
 {
 	ItlRtl8188E *me = ifp ? (ItlRtl8188E *)ifp->if_softc : nullptr;
@@ -1038,9 +1145,11 @@ void ItlRtl8188E::watchdogCb(struct _ifnet *ifp)
 	if (ifp)
 		ieee80211_watchdog(ifp);
 
-	/* Satu kali per detik: publikasikan penghitung ke ioreg. */
-	if (me)
+	/* Satu kali per detik: adaptasi MCS/RX gain dan publikasi stats ke ioreg. */
+	if (me) {
+		me->updateRateAndGain();
 		me->publishStats();
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1360,13 +1469,15 @@ void ItlRtl8188E::sendFrame(mbuf_t m, struct ieee80211_node *ni, bool isMgmt)
 			buf[19] = 0x00;
 			/*
 			 * txdw4 & txdw5:
-			 *   - Unicast data: 0x13 (MCS 7 = 65/72.2 Mb/s di 20 MHz, 135/150 Mb/s di 40 MHz).
+			 *   - Unicast data: 0x0c + fTxMcs (MCS 0..7 adaptif via CCX_RPT).
 			 *   - Mgmt / Bcast / EAPOL: 0x00 (CCK 1 Mb/s).
 			 *   - 40 MHz (HT40): pasang R92C_TXDW4_40MHZ (buf[19] |= 0x02) + SGI40.
 			 *   - Frame 20 MHz pada BSS 40 MHz: pasang DATA_SC di buf[18] bit 4..5.
 			 */
-			uint8_t rate = (!bcast && !isEapol && !isMgmt) ? 0x13 : 0x00;
-			bool use40 = (rate == 0x13) && fBw40 && ni &&
+			bool isUnicastData = !bcast && !isEapol && !isMgmt;
+			uint8_t rate = isUnicastData ?
+			    (uint8_t)(0x0c + (fTxMcs & 0x07)) : 0x00;
+			bool use40 = isUnicastData && fBw40 && ni &&
 			    (ni->ni_chw == IEEE80211_CHAN_WIDTH_40);
 			if (use40) {
 				buf[19] |= 0x02;	/* R92C_TXDW4_40MHZ */
@@ -1378,13 +1489,17 @@ void ItlRtl8188E::sendFrame(mbuf_t m, struct ieee80211_node *ni, bool isMgmt)
 				if (fBw40) {
 					buf[18] |= (uint8_t)((fPriChLo ? 1 : 2) << 4);
 				}
-				if (rate == 0x13 && fIc.ic_bss &&
+				if (isUnicastData && fIc.ic_bss &&
 				    ((fIc.ic_bss->ni_flags & IEEE80211_NODE_HT_SGI20) ||
 				     (fIc.ic_bss->ni_htcaps & IEEE80211_HTCAP_SGI20))) {
 					rate |= 0x40;
 				}
 			}
-			buf[10] &= ~0x08;	/* pastikan CCX_RPT mati agar tidak membanjiri Bulk-IN */
+			/* Sampel CCX_RPT 1 dari 16 frame unicast + EAPOL untuk AMRR/diagnostik. */
+			if ((isUnicastData && ((fTxData & 0x0f) == 0)) || isEapol)
+				buf[10] |= 0x08;
+			else
+				buf[10] &= ~0x08;
 			buf[20] = rate;
 			buf[21] = 0x1f;		/* batas fallback rate (RtWlanU @0x14d22f) */
 			buf[22] = 0x01;
@@ -1406,20 +1521,23 @@ void ItlRtl8188E::sendFrame(mbuf_t m, struct ieee80211_node *ni, bool isMgmt)
 		    pipe)) {
 			static int failLog = 0;
 			if (failLog++ < 10 || (failLog % 100) == 0) {
-				IOLog(LOGP "bulkSend gagal (%u byte, pipe %d, count %d)\n",
-				    (unsigned)total, pipe, failLog);
+				IOLog(LOGP "bulkSend gagal (%u byte, pipe %d, mgmt=%d, count %d)\n",
+				    (unsigned)total, pipe, isMgmt ? 1 : 0, failLog);
 			}
 			fTxFail++;
-		} else if (isMgmt) {
-			fTxMgmt++;
 		} else {
-			fTxData++;
-			if (fIc.ic_if.netStat)
-				fIc.ic_if.netStat->outputPackets++;
+			if (isMgmt) {
+				fTxMgmt++;
+			} else {
+				fTxData++;
+				if (fIc.ic_if.netStat)
+					fIc.ic_if.netStat->outputPackets++;
+			}
 		}
 
 		if (!useScratch)
 			IOFree(buf, total);
+
 		mbuf_freem(m);
 
 		/* net80211 menyerahkan referensi node ke driver. */
@@ -1555,13 +1673,28 @@ void ItlRtl8188E::rxCb(void *ctx, const uint8_t *data, uint32_t len)
 		me->fRxTimer->setTimeoutMS(0);
 }
 
+void ItlRtl8188E::kickCb(void *ctx)
+{
+	ItlRtl8188E *me = (ItlRtl8188E *)ctx;
+
+	/* Hanya membangunkan timer — pekerjaan pemulihan jalan di workloop. */
+	if (!me || !me->fRxRunning || !me->fRxTimer)
+		return;
+	me->fRxTimer->setTimeoutMS(0);
+}
+
 void ItlRtl8188E::rxTimerAction(IOTimerEventSource *timer)
 {
 	uint8_t *bufs[32];
 	uint32_t lens[32];
 	int maxLoops = 8;
+	bool recoverRetry = false;
 
 	(void)timer;
+
+	/* Pulihkan pipe USB yang stall / transfer RX yang hilang (di luar thread USB). */
+	if (fRxRunning && fChip.usb.needsRecovery())
+		recoverRetry = !fChip.usb.rxRecover();
 
 	while (maxLoops-- > 0) {
 		uint32_t n = 0, i;
@@ -1581,10 +1714,18 @@ void ItlRtl8188E::rxTimerAction(IOTimerEventSource *timer)
 		if (n == 0)
 			break;
 
+		struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 		for (i = 0; i < n; i++) {
-			if (fRxRunning)
-				handleRx(bufs[i], lens[i]);
+			if (fRxRunning && fIfAttached)
+				handleRx(bufs[i], lens[i], &ml);
 			IOFree(bufs[i], lens[i]);
+		}
+		if (ml.ml_len > 0) {
+			fRxDelivered += ml.ml_len;
+			if (fIfAttached && fRxRunning)
+				if_input(&fIc.ic_if, &ml);
+			else
+				ml_purge(&ml);
 		}
 	}
 
@@ -1598,6 +1739,9 @@ void ItlRtl8188E::rxTimerAction(IOTimerEventSource *timer)
 	IOLockUnlock(fRxLock);
 	if (hasMore && fRxRunning) {
 		fRxTimer->setTimeoutMS(0);
+	} else if (recoverRetry && fRxRunning) {
+		/* Pemulihan belum tuntas: coba lagi tanpa busy-loop. */
+		fRxTimer->setTimeoutMS(50);
 	}
 }
 
@@ -1658,27 +1802,31 @@ rxSlotOk(const uint8_t *buf, uint32_t len, uint32_t off)
 	dw3 = rxDescDw(buf, off, 3);
 	rpt_sel = (uint8_t)((dw3 >> 14) & 0x03);
 	if (rpt_sel != 0)
-		return info.pktlen > 0 && info.pktlen <= 512;
-	if (info.pktlen == 0 || info.pktlen > 4096)
+		return false;
+	if (info.infosz > 32)
+		return false;
+	if (info.pktlen < sizeof(struct ieee80211_frame_min) ||
+	    info.pktlen > 2400)
 		return false;
 	foff = off + RTWN_USB_RX_DESC_SIZE + info.infosz + info.shift;
-	if (foff + info.pktlen > len ||
-	    info.pktlen < sizeof(struct ieee80211_frame_min))
+	if (foff + info.pktlen > len)
 		return false;
 	wh = (const struct ieee80211_frame *)(buf + foff);
 	if ((wh->i_fc[0] & IEEE80211_FC0_VERSION_MASK) !=
 	    IEEE80211_FC0_VERSION_0)
 		return false;
 	type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
-	return type == IEEE80211_FC0_TYPE_MGT ||
-	    type == IEEE80211_FC0_TYPE_DATA ||
-	    type == IEEE80211_FC0_TYPE_CTL;
+	if (type == IEEE80211_FC0_TYPE_CTL)
+		return true;
+	if (type != IEEE80211_FC0_TYPE_MGT &&
+	    type != IEEE80211_FC0_TYPE_DATA)
+		return false;
+	return info.pktlen >= sizeof(struct ieee80211_frame);
 }
 
-void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len)
+void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len, struct mbuf_list *ml)
 {
 	struct _ifnet *ifp = &fIc.ic_if;
-	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	uint32_t off = 0;
 
 	while (off + RTWN_USB_RX_DESC_SIZE <= len) {
@@ -1688,7 +1836,8 @@ void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len)
 		struct ieee80211_node *ni;
 		struct ieee80211_rxinfo rxi;
 		mbuf_t m;
-		int8_t rssi = -95;
+		int8_t rssi = (fAvgRssi > -95 && fAvgRssi < 0) ?
+		    (int8_t)fAvgRssi : -85;
 		uint8_t rpt_sel;
 		bool txReport;
 
@@ -1725,34 +1874,54 @@ void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len)
 
 		if (rpt_sel == 1 && foff + 4 <= len) {
 			const uint8_t *rpt = buf + foff;
+			bool ok = (rpt[1] & 0x40) != 0;
+			uint8_t retries = (uint8_t)(rpt[2] & 0x3f);
+			uint8_t frate = (foff + 6 <= len) ? (rpt[5] & 0x3f) : 0x0c;
 
 			fTxReport++;
-			if (rpt[1] & 0x40) {
+			if (ok)
 				fTxOk++;
-			}
-			if (rpt[2] & 0x3f) {
+			if (retries)
 				fTxRetry++;
+			if (frate >= 0x04) {
+				fRaTxCnt++;
+				if (ok)
+					fRaOkCnt++;
+				if (retries)
+					fRaRetryCnt += retries;
+			}
+			if (fTxReport <= 12) {
+				IOLog(LOGP "CCX_RPT #%u ok=%d b0=%02x b1=%02x b2=%02x "
+				    "fr=%02x q=%02x\n",
+				    (unsigned)fTxReport, ok ? 1 : 0,
+				    rpt[0], rpt[1], rpt[2],
+				    (foff + 6 <= len) ? rpt[5] : 0xff,
+				    (foff + 7 <= len) ? rpt[6] : 0xff);
 			}
 		}
 
 		/*
-		 * _SegregateDmaAggPackets_8188E (@0x14c7fa) memakai alignment 8-byte,
-		 * sedangkan _SegregateUsbAggPackets_8188E (@0x14c984) memakai 128-byte.
-		 * Jangan batasi loop dengan npkts ((dw2 >> 16) & 0xff) karena pada
-		 * agregasi DMA atau setelah slot TX report nilainya 0!
+		 * Pada RTL8188E USB aggregation (RXDMA_AGG_EN, OpenBSD if_urtwn.c
+		 * align=127), subframe berada pada kelipatan 128-byte (s128), bukan
+		 * 8-byte (s8) kecuali DMA agg khusus. Periksa s128 lebih dulu lalu s8/s4,
+		 * dan jangan lanjutkan bila slot saat ini berupa report (rpt_sel != 0).
 		 */
-		rawLen = RTWN_USB_RX_DESC_SIZE + info.infosz + info.shift + flen;
-		s4 = (rawLen + 3) & ~3u;
-		s8 = (rawLen + 7) & ~7u;
-		s128 = (rawLen + 127) & ~127u;
-		if (rxSlotOk(buf, len, off + s8))
-			next = off + s8;
-		else if (rxSlotOk(buf, len, off + s4))
-			next = off + s4;
-		else if (rxSlotOk(buf, len, off + s128))
-			next = off + s128;
-		else
+		if (rpt_sel != 0) {
 			next = 0;
+		} else {
+			rawLen = RTWN_USB_RX_DESC_SIZE + info.infosz + info.shift + flen;
+			s4 = (rawLen + 3) & ~3u;
+			s8 = (rawLen + 7) & ~7u;
+			s128 = (rawLen + 127) & ~127u;
+			if (rxSlotOk(buf, len, off + s128))
+				next = off + s128;
+			else if (rxSlotOk(buf, len, off + s8))
+				next = off + s8;
+			else if (rxSlotOk(buf, len, off + s4))
+				next = off + s4;
+			else
+				next = 0;
+		}
 
 		if (!txReport) {
 			uint8_t type, sub;
@@ -1878,7 +2047,8 @@ void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len)
 
 			/* RSSI dari PHY status (rtwn_r88e_get_rssi). */
 			if (info.infosz > 0 && info.hasPhyStatus) {
-				const uint8_t *phy = buf + foff - info.infosz;
+				const uint8_t *phy = buf + off +
+				    RTWN_USB_RX_DESC_SIZE;
 
 				if (info.rate <= 3) {
 					static const int8_t cckoff[] =
@@ -1889,6 +2059,17 @@ void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len)
 					rssi = ((agc & 0x1f) > 27) ? -94 :
 					    (int8_t)(cckoff[rpt] -
 					    ((agc & 0x1f) << 1));
+					if (fIc.ic_state == IEEE80211_S_RUN &&
+					    fIc.ic_bss &&
+					    IEEE80211_ADDR_EQ(wh->i_addr2,
+					    fIc.ic_bss->ni_bssid) &&
+					    rssi > -100 && rssi < 0) {
+						fAvgRssi = (fAvgRssi <= -95) ?
+						    (int32_t)rssi :
+						    ((fAvgRssi * 7 + (int32_t)rssi) / 8);
+					}
+				} else if (fAvgRssi > -95 && fAvgRssi < 0) {
+					rssi = (int8_t)fAvgRssi;
 				} else {
 					uint32_t sq = (uint32_t)phy[4] |
 					    ((uint32_t)phy[5] << 8) |
@@ -1930,8 +2111,7 @@ void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len)
 							norm = fIc.ic_max_rssi;
 						rxi.rxi_rssi = norm;
 					}
-					ieee80211_inputm(ifp, m, ni, &rxi,
-					    &ml);
+					ieee80211_inputm(ifp, m, ni, &rxi, ml);
 					ieee80211_release_node(&fIc, ni);
 				} else {
 					mbuf_freem(m);
@@ -1944,10 +2124,6 @@ advance:
 			break;
 		off = next;
 	}
-
-	if (ml.ml_len > 0)
-		fRxDelivered += ml.ml_len;
-	if_input(ifp, &ml);
 }
 
 /* ------------------------------------------------------------------ */

@@ -65,6 +65,10 @@ typedef struct {
 	uint8_t	xtal;
 	uint8_t	regulatory;
 	uint8_t	channel_plan;
+	uint8_t	cck_tx_pwr[6];
+	uint8_t	ht40_tx_pwr[5];
+	uint8_t	ht20_ofdm_diff;
+	uint8_t	txpwr_ok;
 	uint32_t	cr;		/* register CR */
 	uint32_t	mcuwdl;		/* register MCUFWDL */
 	uint32_t	syscfg;
@@ -89,6 +93,7 @@ void rtwn_seq_raw_write2(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx, uint16_t 
 void rtwn_seq_raw_write4(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx, uint16_t addr,
     uint32_t val);
 void rtwn_seq_efuse_parse(const uint8_t *raw, uint16_t rawlen, uint8_t *out);
+void rtwn_seq_extract_txpwr(const uint8_t *rom, rtwn_seq_result_t *r);
 
 /* Power-flow vendor (tabel statik dari binary RtWlanU.kext). */
 int rtwn_flow_power_on_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx);

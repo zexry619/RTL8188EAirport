@@ -29,6 +29,8 @@ typedef void (*RtwnTraceFn)(void *ctx, const char *msg);
 typedef void (*rtwn_rx_cb)(void *ctx, const uint8_t *data, uint32_t len);
 typedef void (*rtwn_tx_cb)(void *ctx, int status);
 typedef void (*rtwn_tx_done_cb)(void *ctx);
+/* Dipanggil dari completion USB: minta driver menjalankan rxRecover() di luar thread USB. */
+typedef void (*rtwn_kick_cb)(void *ctx);
 
 class RtwnUsb;
 
@@ -77,6 +79,8 @@ public:
 	RtwnUsb() : fPipeIn(nullptr), fPipeOut(nullptr), fNumOut(0),
 	    fRxCb(nullptr), fRxCtx(nullptr), fRxCount(0), fTxOk(0), fTxFail(0),
 	    fTxInFlight(0), fTxDoneCb(nullptr), fTxDoneCtx(nullptr),
+	    fKickCb(nullptr), fKickCtx(nullptr), fRxParked(nullptr),
+	    fRxActive(0), fRxErr(0), fRxRecover(0), fLastRxStatus(0),
 	    fBulkClosing(false), fAttached(false), fTxDone(nullptr),
 	    fBulkLock(nullptr), fAlive(nullptr),
 	    fCtlLock(nullptr), fCtlMd(nullptr), fCtlBuf(nullptr), fCtlCap(0),
@@ -160,7 +164,26 @@ public:
 	void setRxCallback(rtwn_rx_cb cb, void *ctx) { fRxCb = cb; fRxCtx = ctx; }
 	void setTxDoneCb(rtwn_tx_done_cb cb, void *ctx) { fTxDoneCb = cb; fTxDoneCtx = ctx; }
 	int32_t txInFlight() const { return fTxInFlight; }
-	bool txBusy() const { return fTxInFlight >= 32; }
+
+	/*
+	 * Pemulihan pipe (stall/error). Completion USB TIDAK boleh melakukan
+	 * control transfer (clearStall(true)) — risiko deadlock dengan workloop.
+	 * Jadi completion hanya "memarkir" transfer RX yang gagal / menandai
+	 * pipe TX, lalu membangunkan driver lewat kick callback. rxRecover()
+	 * dipanggil dari context workloop driver: clearStall + antre ulang.
+	 * Return true bila semua transfer RX sudah aktif kembali.
+	 */
+	void setKickCb(rtwn_kick_cb cb, void *ctx) { fKickCb = cb; fKickCtx = ctx; }
+	bool needsRecovery() const {
+		return fRxParked != nullptr || fPipeStalled[0] || fPipeStalled[1] ||
+		    fPipeStalled[2];
+	}
+	bool rxRecover();
+	int32_t rxActive() const { return fRxActive; }
+	uint32_t rxErr() const { return fRxErr; }
+	uint32_t recoverCount() const { return fRxRecover; }
+	uint32_t lastRxStatus() const { return fLastRxStatus; }
+	bool txBusy() const { return fTxInFlight >= 64; }
 
 private:
 	/* Satu control transfer dengan batas waktu sendiri (buffers di heap). */
@@ -189,6 +212,14 @@ public:
 	volatile int32_t    fTxInFlight;
 	rtwn_tx_done_cb     fTxDoneCb;
 	void               *fTxDoneCtx;
+	rtwn_kick_cb        fKickCb;
+	void               *fKickCtx;
+	/* Transfer RX yang gagal diantre ulang, menunggu rxRecover(). */
+	RtwnBulkCtx        *fRxParked;
+	volatile int32_t    fRxActive;
+	uint32_t            fRxErr;
+	uint32_t            fRxRecover;
+	uint32_t            fLastRxStatus;
 
 	/*
 	 * Di Publik karena completion callback (fungsi bebas di

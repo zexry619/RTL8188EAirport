@@ -216,6 +216,7 @@ int rtwn_seq_read_efuse_direct_8188e(rtwn_seq_result_t *r, rtwn_read_fn rd,
 	r->xtal = rom[185];
 	r->channel_plan = rom[184];
 	r->regulatory = (uint8_t)(rom[193] & 0x07);
+	rtwn_seq_extract_txpwr(rom, r);
 	r->efuse_ok = 1;
 	r->step = 2;
 	return 0;

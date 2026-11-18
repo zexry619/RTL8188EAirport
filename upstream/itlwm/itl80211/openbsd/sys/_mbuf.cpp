@@ -59,6 +59,11 @@ static IOReturn _if_input(OSObject *target, void *arg0, void *arg1, void *arg2, 
 
 int if_input(struct _ifnet *ifq, struct mbuf_list *ml)
 {
+    if (!_fCommandGate) {
+        if (ml)
+            ml_purge(ml);
+        return kIOReturnNotReady;
+    }
     return _fCommandGate->runAction((IOCommandGate::Action)_if_input, ifq, ml);
 }
 

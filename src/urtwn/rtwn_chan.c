@@ -269,3 +269,333 @@ rtwn_set_chan_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx, uint8_t chan)
 {
 	return rtwn_set_chan_bw_8188e(rd, wr, ctx, chan, 0, 0);
 }
+
+/* ── TX Power dari EFUSE (rtwn_r88e_get_txpower + rtwn_write_txpower) ── */
+
+static int8_t
+sign4to8(uint8_t v)
+{
+	v &= 0x0f;
+	return (v & 0x08) ? (int8_t)(v | 0xf0) : (int8_t)v;
+}
+
+static uint8_t
+clamp_txpwr(int v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 0x3f)
+		return 0x3f;
+	return (uint8_t)v;
+}
+
+void
+rtwn_set_txpower_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
+    uint8_t chan, int bw40, const uint8_t cck_pwr[6],
+    const uint8_t ht40_pwr[5], uint8_t ht20_ofdm_diff)
+{
+	int group;
+	uint8_t cckpow, cck2pow, htpow, ofdmpow, mcspow;
+	int8_t ofdm_diff, ht20_diff;
+	uint32_t reg, v4;
+
+	if (!cck_pwr || !ht40_pwr || chan < 1 || chan > 14)
+		return;
+
+	if (chan <= 2)
+		group = 0;
+	else if (chan <= 5)
+		group = 1;
+	else if (chan <= 8)
+		group = 2;
+	else if (chan <= 11)
+		group = 3;
+	else if (chan <= 13)
+		group = 4;
+	else
+		group = 5;
+
+	cckpow = (cck_pwr[group] <= 0x3f) ? cck_pwr[group] : 0x2d;
+	cck2pow = (cckpow >= 9) ? (uint8_t)(cckpow - 9) : 0;
+
+	{
+		uint8_t raw_ht = ht40_pwr[(group == 5) ? 4 : group];
+		htpow = (raw_ht <= 0x3f) ? raw_ht : 0x2d;
+	}
+
+	ofdm_diff = (ht20_ofdm_diff == 0xff) ? 0 : sign4to8(ht20_ofdm_diff & 0x0f);
+	ht20_diff = (ht20_ofdm_diff == 0xff) ? 0 : sign4to8((ht20_ofdm_diff >> 4) & 0x0f);
+
+	ofdmpow = clamp_txpwr((int)htpow + (int)ofdm_diff);
+	mcspow = clamp_txpwr((int)htpow + (bw40 ? 0 : (int)ht20_diff));
+
+	/* CCK TXAGC (chain 0: 0xe08 + 0x86c). */
+	reg = rtwn_bb_read(rd, wr, ctx, 0xe08);
+	if (reg != 0xffffffffu) {
+		reg = (reg & ~0x0000ff00u) | ((uint32_t)cckpow << 8);
+		rtwn_bb_write(rd, wr, ctx, 0xe08, reg);
+	}
+	reg = rtwn_bb_read(rd, wr, ctx, 0x86c);
+	if (reg != 0xffffffffu) {
+		reg = (reg & 0x000000ffu) | ((uint32_t)cck2pow << 8) |
+		    ((uint32_t)cckpow << 16) | ((uint32_t)cckpow << 24);
+		rtwn_bb_write(rd, wr, ctx, 0x86c, reg);
+	}
+
+	/* OFDM 6..54 (0xe00, 0xe04). */
+	v4 = (uint32_t)ofdmpow | ((uint32_t)ofdmpow << 8) |
+	    ((uint32_t)ofdmpow << 16) | ((uint32_t)ofdmpow << 24);
+	rtwn_bb_write(rd, wr, ctx, 0xe00, v4);
+	rtwn_bb_write(rd, wr, ctx, 0xe04, v4);
+
+	/* HT MCS 0..7 (0xe10, 0xe14). */
+	v4 = (uint32_t)mcspow | ((uint32_t)mcspow << 8) |
+	    ((uint32_t)mcspow << 16) | ((uint32_t)mcspow << 24);
+	rtwn_bb_write(rd, wr, ctx, 0xe10, v4);
+	rtwn_bb_write(rd, wr, ctx, 0xe14, v4);
+}
+
+/* ── Kalibrasi LO/IQ & LC (port OpenBSD rtwn.c untuk 8188E 1x1) ───── */
+
+static int
+rtwn_iqk_abs(int x)
+{
+	return (x < 0) ? -x : x;
+}
+
+static int
+rtwn_iq_calib_chain_88e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
+    uint16_t tx[2], uint16_t rx[2])
+{
+	uint32_t status;
+
+	/* IQ calibration settings untuk chain 0 (port OpenBSD rtwn.c). */
+	rtwn_bb_write(rd, wr, ctx, 0xe30, 0x10008c1fu);	/* R92C_TX_IQK_TONE_A */
+	rtwn_bb_write(rd, wr, ctx, 0xe54, 0x10008c1fu);	/* R92C_RX_IQK_TONE_B */
+	rtwn_bb_write(rd, wr, ctx, 0xe34, 0x10008c1fu);	/* R92C_RX_IQK_TONE_A */
+	rtwn_bb_write(rd, wr, ctx, 0xe38, 0x82140102u);	/* R92C_TX_IQK_PI_A */
+	rtwn_bb_write(rd, wr, ctx, 0xe3c, 0x28160502u);	/* R92C_RX_IQK_PI_A */
+
+	rtwn_bb_write(rd, wr, ctx, 0xe4c, 0x00462911u);	/* R92C_IQK_AGC_RSP */
+	rtwn_bb_write(rd, wr, ctx, 0xe48, 0xf9000000u);	/* R92C_IQK_AGC_PTS */
+	rtwn_bb_write(rd, wr, ctx, 0xe48, 0xf8000000u);
+
+	RTWN_DELAY_MS(1);
+
+	status = rtwn_bb_read(rd, wr, ctx, 0xeac);
+	if (status & (1u << 28))
+		return 0;	/* TX fail */
+
+	tx[0] = (uint16_t)((rtwn_bb_read(rd, wr, ctx, 0xe94) >> 16) & 0x3ff);
+	tx[1] = (uint16_t)((rtwn_bb_read(rd, wr, ctx, 0xe9c) >> 16) & 0x3ff);
+	if (tx[0] == 0x142 || tx[1] == 0x042)
+		return 0;
+
+	if (status & (1u << 27))
+		return 1;	/* RX fail */
+
+	rx[0] = (uint16_t)((rtwn_bb_read(rd, wr, ctx, 0xea4) >> 16) & 0x3ff);
+	rx[1] = (uint16_t)((rtwn_bb_read(rd, wr, ctx, 0xeac) >> 16) & 0x3ff);
+	if (rx[0] == 0x132 || rx[1] == 0x036)
+		return 1;
+
+	return 3;
+}
+
+void
+rtwn_iq_calib_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
+{
+	static const uint16_t reg_adda[16] = {
+		0x85c, 0xe6c, 0xe70, 0xe74, 0xe78, 0xe7c, 0xe80, 0xe84,
+		0xe88, 0xe8c, 0xed0, 0xed4, 0xed8, 0xedc, 0xee0, 0xeec
+	};
+	uint32_t save_adda[16];
+	uint32_t ofdm0_trxpathena = 0, ofdm0_trmuxpar = 0;
+	uint32_t rfsw0 = 0, rfsw1 = 0, rfoe0 = 0, rfoe1 = 0;
+	uint32_t ant_a = 0, ant_b = 0, cck_afe = 0, hssi_p1 = 0;
+	uint8_t gpio_mux = 0;
+	uint8_t txpause = 0, bcn_ctrl = 0, bcn_ctrl1 = 0, xa_agc = 0x20;
+	uint16_t tx[3][2], rx[3][2];
+	int n, i, valid = 0;
+
+	memset(tx, 0, sizeof(tx));
+	memset(rx, 0, sizeof(rx));
+	xa_agc = (uint8_t)(rtwn_bb_read(rd, wr, ctx, 0xc50) & 0xff);
+
+	for (n = 0; n < 3; n++) {
+		if (n == 0) {
+			for (i = 0; i < 16; i++)
+				save_adda[i] = rtwn_bb_read(rd, wr, ctx, reg_adda[i]);
+			txpause = rtwn_seq_raw_read1(rd, wr, ctx, 0x522);
+			bcn_ctrl = rtwn_seq_raw_read1(rd, wr, ctx, 0x550);
+			bcn_ctrl1 = rtwn_seq_raw_read1(rd, wr, ctx, 0x551);
+			gpio_mux = rtwn_seq_raw_read1(rd, wr, ctx, 0x040);
+			ofdm0_trxpathena = rtwn_bb_read(rd, wr, ctx, 0xc04);
+			ofdm0_trmuxpar = rtwn_bb_read(rd, wr, ctx, 0xc08);
+			rfsw0 = rtwn_bb_read(rd, wr, ctx, 0x870);
+			rfsw1 = rtwn_bb_read(rd, wr, ctx, 0x874);
+			rfoe0 = rtwn_bb_read(rd, wr, ctx, 0x860);
+			rfoe1 = rtwn_bb_read(rd, wr, ctx, 0x864);
+			ant_a = rtwn_bb_read(rd, wr, ctx, 0xb68);
+			ant_b = rtwn_bb_read(rd, wr, ctx, 0xb6c);
+			cck_afe = rtwn_bb_read(rd, wr, ctx, 0xa04);
+		}
+
+		rtwn_bb_write(rd, wr, ctx, reg_adda[0], 0x0b1b25a0u);
+		for (i = 1; i < 16; i++)
+			rtwn_bb_write(rd, wr, ctx, reg_adda[i], 0x0bdb25a0u);
+
+		hssi_p1 = rtwn_bb_read(rd, wr, ctx, 0x820);
+		if (!(hssi_p1 & (uint32_t)R92C_HSSI_PARAM1_PI)) {
+			rtwn_bb_write(rd, wr, ctx, 0x820,
+			    hssi_p1 | (uint32_t)R92C_HSSI_PARAM1_PI);
+		}
+
+		rtwn_bb_write(rd, wr, ctx, 0xc04, 0x03a05600u);
+		rtwn_bb_write(rd, wr, ctx, 0xc08, 0x000800e4u);
+		rtwn_bb_write(rd, wr, ctx, 0x874, 0x22204000u);
+
+		rtwn_seq_raw_write1(rd, wr, ctx, 0x522, 0x3f);
+		rtwn_seq_raw_write1(rd, wr, ctx, 0x550, (uint8_t)(bcn_ctrl & ~0x08u));
+		rtwn_seq_raw_write1(rd, wr, ctx, 0x551, (uint8_t)(bcn_ctrl1 & ~0x08u));
+		rtwn_seq_raw_write1(rd, wr, ctx, 0x040, (uint8_t)(gpio_mux & ~0x20u));
+
+		rtwn_bb_write(rd, wr, ctx, 0xb68, 0x00080000u);
+		rtwn_bb_write(rd, wr, ctx, 0xe28, 0x80800000u);
+		rtwn_bb_write(rd, wr, ctx, 0xe40, 0x01007c00u);
+		rtwn_bb_write(rd, wr, ctx, 0xe44, 0x01004800u);
+		rtwn_bb_write(rd, wr, ctx, 0xb68, 0x00080000u);
+
+		for (i = 0; i < 2; i++) {
+			int ret = rtwn_iq_calib_chain_88e(rd, wr, ctx, tx[n], rx[n]);
+			if (ret == 0) {
+				tx[n][0] = tx[n][1] = 0xff;
+				rx[n][0] = rx[n][1] = 0xff;
+			} else if (ret == 1) {
+				rx[n][0] = rx[n][1] = 0xff;
+			}
+		}
+
+		rtwn_bb_write(rd, wr, ctx, 0xe28, 0x00000000u);
+		rtwn_bb_write(rd, wr, ctx, 0x840, 0x00032ed3u);
+
+		if (n != 0) {
+			if (!(hssi_p1 & (uint32_t)R92C_HSSI_PARAM1_PI))
+				rtwn_bb_write(rd, wr, ctx, 0x820, hssi_p1);
+			for (i = 0; i < 16; i++)
+				rtwn_bb_write(rd, wr, ctx, reg_adda[i], save_adda[i]);
+			rtwn_seq_raw_write1(rd, wr, ctx, 0x522, txpause);
+			rtwn_seq_raw_write1(rd, wr, ctx, 0x550, bcn_ctrl);
+			rtwn_seq_raw_write1(rd, wr, ctx, 0x551, bcn_ctrl1);
+			rtwn_seq_raw_write1(rd, wr, ctx, 0x040, gpio_mux);
+			rtwn_bb_write(rd, wr, ctx, 0xc04, ofdm0_trxpathena);
+			rtwn_bb_write(rd, wr, ctx, 0x870, rfsw0);
+			rtwn_bb_write(rd, wr, ctx, 0x874, rfsw1);
+			rtwn_bb_write(rd, wr, ctx, 0x860, rfoe0);
+			rtwn_bb_write(rd, wr, ctx, 0x864, rfoe1);
+			rtwn_bb_write(rd, wr, ctx, 0xc08, ofdm0_trmuxpar);
+			rtwn_bb_write(rd, wr, ctx, 0xb68, ant_a);
+			rtwn_bb_write(rd, wr, ctx, 0xb6c, ant_b);
+			rtwn_bb_write(rd, wr, ctx, 0xa04, cck_afe);
+
+			{
+				uint32_t agc = rtwn_bb_read(rd, wr, ctx, 0xc50) & ~0xffu;
+				rtwn_bb_write(rd, wr, ctx, 0xc50, agc | 0x50u);
+				rtwn_bb_write(rd, wr, ctx, 0xc50, agc | (uint32_t)xa_agc);
+			}
+			rtwn_bb_write(rd, wr, ctx, 0xe30, 0x01008c00u);
+			rtwn_bb_write(rd, wr, ctx, 0xe34, 0x01008c00u);
+
+			if (tx[n - 1][0] != 0xff && tx[n][0] != 0xff &&
+			    tx[n - 1][1] != 0xff && tx[n][1] != 0xff &&
+			    rx[n - 1][0] != 0xff && rx[n][0] != 0xff &&
+			    rx[n - 1][1] != 0xff && rx[n][1] != 0xff &&
+			    rtwn_iqk_abs((int)tx[n - 1][0] - (int)tx[n][0]) <= 5 &&
+			    rtwn_iqk_abs((int)tx[n - 1][1] - (int)tx[n][1]) <= 5 &&
+			    rtwn_iqk_abs((int)rx[n - 1][0] - (int)rx[n][0]) <= 5 &&
+			    rtwn_iqk_abs((int)rx[n - 1][1] - (int)rx[n][1]) <= 5) {
+				valid = 1;
+				break;
+			}
+		}
+	}
+
+	if (valid && tx[n][0] != 0xff && tx[n][1] != 0xff) {
+		uint32_t reg, val, x;
+		long y, tx_c;
+
+		reg = rtwn_bb_read(rd, wr, ctx, 0xc80);
+		val = (reg >> 22) & 0x3ff;
+		x = tx[n][0];
+		if (x & 0x200)
+			x |= 0xfffffc00u;
+		reg = (reg & ~0x3ffu) | (((x * val) >> 8) & 0x3ffu);
+		rtwn_bb_write(rd, wr, ctx, 0xc80, reg);
+
+		reg = rtwn_bb_read(rd, wr, ctx, 0xc4c);
+		if (((x * val) >> 7) & 1)
+			reg |= 0x80000000u;
+		else
+			reg &= ~0x80000000u;
+		rtwn_bb_write(rd, wr, ctx, 0xc4c, reg);
+
+		y = (long)tx[n][1];
+		if (y & 0x200)
+			y |= ~0x3ffL;
+		tx_c = (y * (long)val) >> 8;
+
+		reg = rtwn_bb_read(rd, wr, ctx, 0xc94);
+		reg = (reg & ~0xf0000000u) | (uint32_t)((tx_c & 0x3c0) << 22);
+		rtwn_bb_write(rd, wr, ctx, 0xc94, reg);
+
+		reg = rtwn_bb_read(rd, wr, ctx, 0xc80);
+		reg = (reg & ~0x003f0000u) | (uint32_t)((tx_c & 0x3f) << 16);
+		rtwn_bb_write(rd, wr, ctx, 0xc80, reg);
+
+		reg = rtwn_bb_read(rd, wr, ctx, 0xc4c);
+		if (((y * (long)val) >> 7) & 1)
+			reg |= 0x20000000u;
+		else
+			reg &= ~0x20000000u;
+		rtwn_bb_write(rd, wr, ctx, 0xc4c, reg);
+
+		if (rx[n][0] != 0xff && rx[n][1] != 0xff) {
+			reg = rtwn_bb_read(rd, wr, ctx, 0xc14);
+			reg = (reg & ~0x3ffu) | (rx[n][0] & 0x3ffu);
+			reg = (reg & ~0xfc00u) | ((rx[n][1] & 0x03fu) << 10);
+			rtwn_bb_write(rd, wr, ctx, 0xc14, reg);
+
+			reg = rtwn_bb_read(rd, wr, ctx, 0xca0);
+			reg = (reg & ~0xf0000000u) | ((rx[n][1] & 0x3c0u) << 22);
+			rtwn_bb_write(rd, wr, ctx, 0xca0, reg);
+		}
+	}
+}
+
+void
+rtwn_lc_calib_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
+{
+	uint8_t txmode;
+	uint32_t rf_ac = 0, chnlbw;
+
+	txmode = rtwn_seq_raw_read1(rd, wr, ctx, 0xd03);
+	if ((txmode & 0x70) != 0) {
+		rtwn_seq_raw_write1(rd, wr, ctx, 0xd03, (uint8_t)(txmode & ~0x70u));
+		rf_ac = rtwn_rf_read_8188e(rd, wr, ctx, 0, 0x00);
+		rtwn_rf_write_8188e(rd, wr, ctx, 0, 0x00,
+		    (rf_ac & ~0x70000u) | 0x10000u);
+	} else {
+		rtwn_seq_raw_write1(rd, wr, ctx, 0x522, 0x3f);
+	}
+
+	chnlbw = rtwn_rf_read_8188e(rd, wr, ctx, 0, R92C_RF_CHNLBW);
+	rtwn_rf_write_8188e(rd, wr, ctx, 0, R92C_RF_CHNLBW, chnlbw | 0x08000u);
+	RTWN_DELAY_MS(1);
+
+	if ((txmode & 0x70) != 0) {
+		rtwn_seq_raw_write1(rd, wr, ctx, 0xd03, txmode);
+		rtwn_rf_write_8188e(rd, wr, ctx, 0, 0x00, rf_ac);
+	} else {
+		rtwn_seq_raw_write1(rd, wr, ctx, 0x522, 0x00);
+	}
+}

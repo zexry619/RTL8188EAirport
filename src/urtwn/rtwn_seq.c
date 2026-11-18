@@ -424,6 +424,27 @@ void rtwn_seq_efuse_parse(const uint8_t *raw, uint16_t rawlen, uint8_t *out)
 	efuse_parse_8188e(raw, rawlen, out);
 }
 
+/* Ekstrak parameter TX power 8188E (struct r88e_rom offset 0x10..0x1b). */
+void rtwn_seq_extract_txpwr(const uint8_t *rom, rtwn_seq_result_t *r)
+{
+	int i, any = 0;
+
+	if (!rom || !r)
+		return;
+	for (i = 0; i < 6; i++) {
+		r->cck_tx_pwr[i] = rom[0x10 + i];
+		if (r->cck_tx_pwr[i] != 0xff)
+			any = 1;
+	}
+	for (i = 0; i < 5; i++) {
+		r->ht40_tx_pwr[i] = rom[0x16 + i];
+		if (r->ht40_tx_pwr[i] != 0xff)
+			any = 1;
+	}
+	r->ht20_ofdm_diff = rom[0x1b];
+	r->txpwr_ok = (uint8_t)any;
+}
+
 /* Diekspos untuk differential test (tools/test_efuse_diff.c). */
 void rtwn_seq_parse_efuse_for_test(const uint8_t *raw, uint16_t rawlen,
     uint8_t *out)
@@ -513,6 +534,7 @@ int rtwn_seq_read_efuse(rtwn_seq_result_t *r, rtwn_read_fn rd, rtwn_write_fn wr,
 	r->xtal = rom[185];
 	r->channel_plan = rom[184];
 	r->regulatory = (uint8_t)(rom[193] & 0x07);
+	rtwn_seq_extract_txpwr(rom, r);
 
 	/*
 	 * Sanity check MAC (audit 22 Okt 2026).

@@ -248,22 +248,24 @@ rtwn_aggr_init_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
 	uint32_t reg = 0;
 
 	/*
-	 * Sesuai RtWlanU.kext (live_regs_dump.txt: 0x010c=0xfaf0, 0x0280=0x00000000):
-	 * Matikan RXDMA_AGG_EN agar frame balasan cepat (Assoc Resp, ARP Reply,
-	 * ICMP Echo Reply) tidak ditahan atau digabung di belakang TX Report.
+	 * Aktifkan RX DMA aggregation (OpenBSD if_urtwn.c):
+	 *   - R92C_TRXDMA_CTRL |= RXDMA_AGG_EN
+	 *   - R92C_RXDMA_AGG_PG_TH = 24 halaman (3 KB), timeout = 4 (~128 us)
+	 * Pertahankan R92C_TDECTRL (0x208) dan R92C_TXDMA_OFFSET_CHK (0x20c = 0x0604)
+	 * sesuai nilai stabil v0.9.1 / RtWlanU agar TX Bulk-OUT tidak terpengaruh.
 	 */
 	{
 		uint8_t v = 0;
 		if (rd(ctx, R92C_TRXDMA_CTRL, &v, 1) == 0) {
 			wr8(rd, wr, ctx, R92C_TRXDMA_CTRL,
-			    (uint8_t)(v & ~R92C_TRXDMA_CTRL_RXDMA_AGG_EN));
+			    (uint8_t)(v | R92C_TRXDMA_CTRL_RXDMA_AGG_EN));
 		}
 	}
 
-	wr8(rd, wr, ctx, R92C_RXDMA_AGG_PG_TH, 0);
-	wr8(rd, wr, ctx, (uint16_t)(R92C_RXDMA_AGG_PG_TH + 1), 0);
+	wr8(rd, wr, ctx, R92C_RXDMA_AGG_PG_TH, 24);
+	wr8(rd, wr, ctx, (uint16_t)(R92C_RXDMA_AGG_PG_TH + 1), 4);
 
-	/* Drop bulk-out yang tidak benar (0x0290 = 0x00000604 di RtWlanU). */
+	/* Drop bulk-out yang tidak benar (0x020c = 0x00000604 di RtWlanU). */
 	if (rd32(rd, ctx, R92C_TXDMA_OFFSET_CHK, &reg) == 0) {
 		reg &= ~(uint32_t)R92C_TDECTRL_BLK_DESC_NUM_M;
 		reg |= ((uint32_t)6 << 8) | R92C_TXDMA_OFFSET_CHK_DROP_DATA_EN;
