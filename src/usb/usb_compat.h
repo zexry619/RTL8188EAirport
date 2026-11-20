@@ -137,7 +137,7 @@ public:
 	 * Buffer & transfer TIDAK PERNAH di-free di dalam callback — hanya
 	 * setelah completion & tidak ada lagi yang memakainya.
 	 */
-	bool bulkOpen(IOUSBHostInterface *interface);
+	bool bulkOpen(IOUSBHostInterface *interface, bool clearPipes = false);
 	/* Lepaskan ctx+buffer sebuah transfer (setelah completion selesai). */
 	static void bulkRelease(void *param);
 	void bulkClose();

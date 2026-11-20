@@ -597,7 +597,7 @@ void RtwnUsb::bulkRelease(void *param)
 	IOFree(ctx, sizeof(RtwnBulkCtx));
 }
 
-bool RtwnUsb::bulkOpen(IOUSBHostInterface *interface)
+bool RtwnUsb::bulkOpen(IOUSBHostInterface *interface, bool clearPipes)
 {
 	if (!interface || !fOpen) {
 		return false;
@@ -667,6 +667,14 @@ bool RtwnUsb::bulkOpen(IOUSBHostInterface *interface)
 	fRxActive = 0;
 	for (int i = 0; i < 3; i++) {
 		fPipeStalled[i] = false;
+	}
+	if (clearPipes) {
+		fPipeIn->clearStall(true);
+		for (int i = 0; i < fNumOut; i++) {
+			if (fPipeOutAll[i]) {
+				fPipeOutAll[i]->clearStall(true);
+			}
+		}
 	}
 	return true;
 }

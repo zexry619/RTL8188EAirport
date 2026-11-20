@@ -1606,7 +1606,13 @@ justcleanup:
                     " HE enabled" : "");
 			}
 #if defined(AIRPORT_WCL)
-            if (!(ic->ic_flags & IEEE80211_F_RSNON)) {
+            /*
+             * Jaringan 802.1X/Enterprise butuh interface UP saat assoc agar
+             * supplicant EAPOL macOS bisa mengirim frame autentikasi keluar;
+             * data non-EAPOL tetap ditahan sampai ni_port_valid aktif (#69).
+             */
+            if (!(ic->ic_flags & IEEE80211_F_RSNON) || ni->ni_port_valid ||
+                ic->ic_wcl_enterprise) {
 #elif defined(USE_APPLE_SUPPLICANT)
             {
 #elif (defined IO80211FAMILY_V2)

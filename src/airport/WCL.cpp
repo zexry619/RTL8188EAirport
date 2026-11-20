@@ -281,9 +281,13 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     }
     scanPending = true;
     scanCompleted = false;
-    scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
-        ((scan.type != 2 && scan.ssidLength != 0) ||
-         ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
+    /*
+     * ItlRtl8188E memakai software scan timer (fScanTo) yang hanya mengirim
+     * tepat satu IEEE80211_EVT_SCAN_DONE per siklus dan berhenti di
+     * ieee80211_end_scan(). Menyetel scanSkipCompletion=true akan menelan
+     * satu-satunya SCAN_DONE tersebut dan menahan scanPending selama 20 detik.
+     */
+    scanSkipCompletion = false;
     ic->ic_wcl_scan_requested = true;
     ic->ic_wcl_scan_active = scan.type != 2;
     ic->ic_wcl_scan_ssid_length = scan.type == 2 ? 0 : scan.ssidLength;
@@ -321,6 +325,7 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
         return;
     scanPending = false;
     scanCompleted = false;
+    scanSkipCompletion = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
@@ -740,8 +745,9 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     bzero(joinBSSID, sizeof(joinBSSID));
     disassocIsVoluntary = true;
     ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
-    if ((ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_ASSOC) &&
-        ic->ic_bss && ic->ic_bss->ni_bssid[0] != 0) {
+    const uint8_t *bssid = ic->ic_bss ? ic->ic_bss->ni_bssid : nullptr;
+    if (ic->ic_state > IEEE80211_S_SCAN && bssid &&
+        (bssid[0] | bssid[1] | bssid[2] | bssid[3] | bssid[4] | bssid[5]) != 0) {
         IEEE80211_SEND_MGMT(ic, ic->ic_bss,
             IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
     }
@@ -752,7 +758,7 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
     clearWCLPMKSA();
     ic->ic_wcl_enterprise = false;
-    ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID);
+    ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID | IEEE80211_F_BGSCAN);
     ic->ic_des_esslen = 0;
     bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
     return kIOReturnSuccess;
@@ -837,6 +843,29 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 clearWCLPMKSA();
                 ic->ic_wcl_enterprise = false;
                 explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+                if (!ic->ic_wcl_mac_reconfig) {
+                    wclAssociatedBeacons = 0;
+                    wclBssValid = false;
+                    if (wclLinkIndicated) {
+                        AirportWCL::LinkStatusEvent event = {};
+                        memcpy(event.bssid, joinBSSID, sizeof(event.bssid));
+                        event.up = 0;
+                        event.reason = 255;
+                        wclLinkIndicated = false;
+                        instance->postMessage(this, AirportWCL::LinkStatus, &event, sizeof(event), true);
+                    }
+                    assocNotified = false;
+                    firstBeaconNotified = false;
+                    bzero(joinBSSID, sizeof(joinBSSID));
+                    ieee80211_disable_rsn(ic);
+                    ieee80211_disable_wep(ic);
+                    ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID | IEEE80211_F_BGSCAN);
+                    ic->ic_des_esslen = 0;
+                    bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
+                    ic->ic_wcl_scan_requested = false;
+                    ic->ic_wcl_scan_ssid_length = 0;
+                    ic->ic_wcl_scan_restricted = false;
+                }
             }
             // An address application is requested by WCL itself, not a new
             // adapter reset. Replaying firmware-load events here rotates the

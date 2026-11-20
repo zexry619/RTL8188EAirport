@@ -31,6 +31,7 @@ cp "$SRC/airport/Info.plist" "$KEXT/Contents/Info.plist"
 
 GIT_REV="${GITHUB_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo local)}"
 GIT_REV="${GIT_REV:0:7}"
+DRV_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SRC/airport/Info.plist" 2>/dev/null || echo '0.9.4')"
 
 COMMON=(
 	-arch x86_64
@@ -52,7 +53,7 @@ COMMON=(
 	-D__PRIVATE_SPI__
 	-DAIRPORT
 	-DIEEE80211_STA_ONLY
-	-DITLWM_VERSION='"0.9.2"'
+	-DITLWM_VERSION="\"$DRV_VER\""
 	-DGIT_COMMIT="\"$GIT_REV\""
 	-I"$MKS/Headers"
 	-I"$SRC/urtwn"

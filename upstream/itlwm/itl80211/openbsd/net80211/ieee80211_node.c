@@ -2252,6 +2252,15 @@ ieee80211_clean_nodes(struct ieee80211com *ic, int cache_timeout)
         ni->ni_scangen = gen;
         if (ni->ni_refcnt > 0)
             continue;
+        /*
+         * Make-room sweep saat scan di tempat ramai tidak boleh menghapus
+         * BSSID yang sedang dituju STA (ic_des_bssid), agar join tidak
+         * gagal sebelum mencapai AUTH (port dari ForbiddenItlwm PR #69).
+         */
+        if (!cache_timeout && ic->ic_opmode == IEEE80211_M_STA &&
+            (ic->ic_flags & IEEE80211_F_DESBSSID) &&
+            IEEE80211_ADDR_EQ(ni->ni_bssid, ic->ic_des_bssid))
+            continue;
 #ifndef IEEE80211_STA_ONLY
         if ((ic->ic_opmode == IEEE80211_M_HOSTAP ||
              ic->ic_opmode == IEEE80211_M_IBSS) &&
