@@ -559,6 +559,56 @@ IOReturn ItlRtl8188E::enable(IONetworkInterface *interface)
 	(void)interface;
 	struct _ifnet *ifp = &fIc.ic_if;
 
+	if ((ifp->if_flags & IFF_UP) && fChipReady && fBulkReady)
+		return kIOReturnSuccess;
+
+	/*
+	 * Pasca S3 sleep/wake atau Wi-Fi toggle Off->On: bila chip/pipe
+	 * sudah dimatikan oleh disable(), inisialisasi ulang hardware dan
+	 * buka kembali pipe bulk sebelum net80211 masuk S_SCAN.
+	 */
+	if (!fChipReady) {
+		setDiag("RTL8188E-stage", "resume-chip-init");
+		int initOk = -1;
+		for (int attempt = 0; attempt < 3; attempt++) {
+			if (attempt > 0)
+				IOSleep(100);
+			if (initChip() == 0) {
+				initOk = 0;
+				break;
+			}
+		}
+		if (initOk != 0) {
+			IOLog(LOGP "enable: initChip gagal pasca-resume\n");
+			setDiag("RTL8188E-stage", "fail-resume-init");
+			return kIOReturnError;
+		}
+	}
+
+	if (!fBulkReady) {
+		setDiag("RTL8188E-stage", "resume-bulk-open");
+		if (!fInterface || !fChip.usb.bulkOpen(fInterface)) {
+			IOLog(LOGP "enable: bulkOpen gagal pasca-resume\n");
+			setDiag("RTL8188E-stage", "fail-resume-bulk");
+			return kIOReturnError;
+		}
+		fRxRunning = true;
+		fChip.usb.setTxDoneCb(txDoneHook, this);
+		fChip.usb.setRxCallback(rxCb, this);
+		fChip.usb.setKickCb(kickCb, this);
+		if (!fChip.usb.bulkQueueRx(32)) {
+			IOLog(LOGP "enable: bulkQueueRx gagal pasca-resume\n");
+			fRxRunning = false;
+			fChip.usb.setTxDoneCb(nullptr, nullptr);
+			fChip.usb.setRxCallback(nullptr, nullptr);
+			fChip.usb.setKickCb(nullptr, nullptr);
+			fChip.usb.bulkClose();
+			setDiag("RTL8188E-stage", "fail-resume-rx");
+			return kIOReturnError;
+		}
+		fBulkReady = true;
+	}
+
 	/* Pastikan register MAC chip cocok dengan ic_myaddr */
 	for (int i = 0; i < IEEE80211_ADDR_LEN; i++) {
 		uint8_t b = fIc.ic_myaddr[i];
@@ -567,10 +617,16 @@ IOReturn ItlRtl8188E::enable(IONetworkInterface *interface)
 		fChip.macaddr[i] = b;
 	}
 
-	if (ifp->if_flags & IFF_UP)
-		return kIOReturnSuccess;
+	/* Reset state adaptasi rate/gain agar bersih pasca-resume */
+	fTxMcs = 7;
+	fRaTxCnt = 0;
+	fRaOkCnt = 0;
+	fRaRetryCnt = 0;
+	fRaSuccessStreak = 0;
+	fCurRxGain = 0;
 
 	ifp->if_flags |= IFF_UP | IFF_RUNNING;
+	ifp->if_flags &= ~IFF_OACTIVE;
 	fEnabled = true;
 	fRxRunning = true;
 	setDiag("RTL8188E-stage", "enabled");
@@ -592,7 +648,7 @@ IOReturn ItlRtl8188E::disable(IONetworkInterface *interface)
 	(void)interface;
 	struct _ifnet *ifp = &fIc.ic_if;
 
-	if (!(ifp->if_flags & IFF_UP))
+	if (!(ifp->if_flags & IFF_UP) && !fBulkReady && !fChipReady)
 		return kIOReturnSuccess;
 
 	ifp->if_flags &= ~(IFF_UP | IFF_RUNNING);
@@ -603,6 +659,28 @@ IOReturn ItlRtl8188E::disable(IONetworkInterface *interface)
 		timeout_del(&fScanTo);
 	if (fIc.ic_state != IEEE80211_S_INIT)
 		ieee80211_new_state(&fIc, IEEE80211_S_INIT, -1);
+
+	/*
+	 * Tutup pipe USB bulk (batalkan 32 URB RX yang menggantung) dan
+	 * matikan radio chip agar AppleUSBXHCISPT bisa masuk S3 sleep
+	 * dengan bersih dan wake tidak meninggalkan pipe USB mati.
+	 */
+	if (fBulkReady) {
+		fChip.usb.setTxDoneCb(nullptr, nullptr);
+		fChip.usb.setRxCallback(nullptr, nullptr);
+		fChip.usb.setKickCb(nullptr, nullptr);
+		fChip.usb.bulkClose();
+		fBulkReady = false;
+	}
+	if (fRxTimer)
+		fRxTimer->cancelTimeout();
+	if (fTxTimer)
+		fTxTimer->cancelTimeout();
+	rxQueueFree();
+	if (fChipReady) {
+		rtwn_flow_radio_off_8188e(halRead, halWrite, this);
+		fChipReady = false;
+	}
 
 	if (fIc.ic_event_handler)
 		fIc.ic_event_handler(&fIc, IEEE80211_EVT_DRIVER_STOPPED, NULL);

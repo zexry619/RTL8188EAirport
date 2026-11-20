@@ -664,6 +664,7 @@ bool RtwnUsb::bulkOpen(IOUSBHostInterface *interface)
 	IOLog(LOGP "usb: pipe bulk IN=%p OUT=%d (ep0=%p) siap\n",
 	    (void *)fPipeIn, fNumOut, (void *)fPipeOut);
 	fTxInFlight = 0;
+	fRxActive = 0;
 	for (int i = 0; i < 3; i++) {
 		fPipeStalled[i] = false;
 	}
