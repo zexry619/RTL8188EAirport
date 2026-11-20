@@ -192,10 +192,11 @@ int ItlRtl8188E::initChip(void)
 {
 	rtwn_seq_result_t res;
 	rtwn_seq_result_t ef;
-	int rc = 0;
+	int macN = 0, bbN = 0, rfN = 0, cfgRc = 0;
 
 	memset(&res, 0, sizeof(res));
 	memset(&ef, 0, sizeof(ef));
+	fChip.usb.resetFailures();
 
 	/* TP-Link TL-WN725N (RTL8188EUS) memiliki 2 endpoint Bulk-OUT:
 	 *   EP 0x02 (pipe 0) = High Queue (HQ: VO, VI, MGNT, HIGH)
@@ -260,14 +261,22 @@ int ItlRtl8188E::initChip(void)
 	    fCckTxPwr[0], fCckTxPwr[2], fCckTxPwr[4],
 	    fHt40TxPwr[0], fHt40TxPwr[2], fHt40TxPwr[4], fHt20OfdmDiff);
 
-	rc += rtwn_init_mac_8188e(halRead, halWrite, this);
-	rc += rtwn_init_bb_8188e(halRead, halWrite, this, fChip.xtal);
-	rc += rtwn_init_rf_8188e(halRead, halWrite, this);
-	rc += rtwn_core_config_8188e(halRead, halWrite, this, fMac);
+	macN = rtwn_init_mac_8188e(halRead, halWrite, this);
+	bbN = (macN > 0) ?
+	    rtwn_init_bb_8188e(halRead, halWrite, this, fChip.xtal) : -1;
+	rfN = (bbN > 0) ? rtwn_init_rf_8188e(halRead, halWrite, this) : -1;
+	cfgRc = (rfN > 0) ?
+	    rtwn_core_config_8188e(halRead, halWrite, this, fMac) : -1;
+	if (macN <= 0 || bbN <= 0 || rfN <= 0 || cfgRc != 0 ||
+	    fChip.usb.isControlDead()) {
+		IOLog(LOGP "initChip gagal (mac=%d bb=%d rf=%d cfg=%d usbDead=%d)\n",
+		    macN, bbN, rfN, cfgRc, fChip.usb.isControlDead() ? 1 : 0);
+		return -1;
+	}
 
 	IOSleep(2);
 	fChipReady = true;
-	IOLog(LOGP "init selesai (%d register)\n", rc);
+	IOLog(LOGP "init selesai (%d register)\n", macN + bbN + rfN);
 	return 0;
 }
 
@@ -280,8 +289,11 @@ void ItlRtl8188E::stopChip(void)
 		fBulkReady = false;
 	}
 	if (fChipReady) {
-		/* Radio off supaya chip tidak memancar saat unload. */
-		rtwn_flow_radio_off_8188e(halRead, halWrite, this);
+		/* Radio off supaya chip tidak memancar saat unload (bila USB masih hidup). */
+		if (fChip.usb.isDeviceAlive()) {
+			fChip.usb.resetFailures();
+			rtwn_flow_radio_off_8188e(halRead, halWrite, this);
+		}
 		fChipReady = false;
 	}
 	if (fAttached) {
@@ -562,23 +574,52 @@ IOReturn ItlRtl8188E::enable(IONetworkInterface *interface)
 	if ((ifp->if_flags & IFF_UP) && fChipReady && fBulkReady)
 		return kIOReturnSuccess;
 
+	if (!fChip.usb.isDeviceAlive()) {
+		IOLog(LOGP "enable: perangkat USB tidak aktif/terputus\n");
+		setDiag("RTL8188E-stage", "fail-usb-inactive");
+		return kIOReturnNoDevice;
+	}
+
 	/*
 	 * Pasca S3 sleep/wake atau Wi-Fi toggle Off->On: bila chip/pipe
-	 * sudah dimatikan oleh disable(), inisialisasi ulang hardware dan
-	 * buka kembali pipe bulk sebelum net80211 masuk S_SCAN.
+	 * sudah dimatikan oleh disable(), tunggu endpoint USB benar-benar
+	 * responsif (baca 1 register ringan) sebelum menjalankan ratusan
+	 * transfer control initChip(). Ini mencegah badai transaction error
+	 * (0xe00002ed) saat port USB baru bangun dari D3/DarkWake.
 	 */
 	if (!fChipReady) {
+		uint32_t sysCfg = 0;
+		bool usbReady = false;
+		for (int probeTry = 0; probeTry < 6; probeTry++) {
+			if (!fChip.usb.isDeviceAlive())
+				return kIOReturnNoDevice;
+			fChip.usb.resetFailures();
+			if (halRead(this, R92C_SYS_CFG, &sysCfg, 4) == 0) {
+				usbReady = true;
+				break;
+			}
+			IOSleep(50);
+		}
+		if (!usbReady) {
+			IOLog(LOGP "enable: endpoint kontrol USB belum responsif pasca-resume\n");
+			setDiag("RTL8188E-stage", "fail-resume-probe");
+			return kIOReturnNotResponding;
+		}
+
 		setDiag("RTL8188E-stage", "resume-chip-init");
 		int initOk = -1;
 		for (int attempt = 0; attempt < 3; attempt++) {
+			if (!fChip.usb.isDeviceAlive())
+				return kIOReturnNoDevice;
 			if (attempt > 0)
-				IOSleep(100);
+				IOSleep(150);
 			if (initChip() == 0) {
 				initOk = 0;
 				break;
 			}
 		}
 		if (initOk != 0) {
+			fChipReady = false;
 			IOLog(LOGP "enable: initChip gagal pasca-resume\n");
 			setDiag("RTL8188E-stage", "fail-resume-init");
 			return kIOReturnError;
@@ -682,7 +723,10 @@ IOReturn ItlRtl8188E::disable(IONetworkInterface *interface)
 		fTxTimer->cancelTimeout();
 	rxQueueFree();
 	if (fChipReady) {
-		rtwn_flow_radio_off_8188e(halRead, halWrite, this);
+		if (fChip.usb.isDeviceAlive()) {
+			fChip.usb.resetFailures();
+			rtwn_flow_radio_off_8188e(halRead, halWrite, this);
+		}
 		fChipReady = false;
 	}
 

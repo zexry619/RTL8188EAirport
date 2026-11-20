@@ -247,7 +247,8 @@ int RtwnUsb::rtwnCtlTransfer(bool isInput, uint8_t requestType,
     uint32_t *bytesOut)
 {
 	/* ‑‑‑ Validasi ketat sebelum menyentuh USB ‑‑‑ */
-	if (!fDevice || !fOpen || !fCtlLock) {
+	if (!fDevice || !fOpen || !fCtlLock ||
+	    fDevice->isInactive() || (fInterface && fInterface->isInactive())) {
 		return -1;
 	}
 	if (len == 0 || len > 0xffff) {
@@ -336,6 +337,10 @@ int RtwnUsb::rtwnCtlTransfer(bool isInput, uint8_t requestType,
 		 * ctx SENGAJA TIDAK dibebaskan. Stack USB mungkin sudah
 		 * memegang ctx->md / ctx->buf.
 		 */
+		if ((err == kIOReturnNoDevice || err == kIOReturnNotAttached ||
+		     err == kIOReturnOffline) && fMaxFails > 0) {
+			fConsecutiveFails = fMaxFails;
+		}
 		IOLockUnlock(fCtlLock);
 		return -1;
 	}
@@ -380,6 +385,10 @@ int RtwnUsb::rtwnCtlTransfer(bool isInput, uint8_t requestType,
 	 * murah daripada kernel panic. (Aturan A1 — lihat docs/HANDOVER.md)
 	 */
 	IOLockUnlock(fCtlLock);
+	if ((status == kIOReturnNoDevice || status == kIOReturnNotAttached ||
+	     status == kIOReturnOffline) && fMaxFails > 0) {
+		fConsecutiveFails = fMaxFails;
+	}
 	return (status == kIOReturnSuccess) ? 0 : -1;
 }
 
@@ -394,7 +403,11 @@ void RtwnUsb::abortAll()
 
 int RtwnUsb::controlIn(uint8_t bRequest, uint16_t wValue, void *data, uint32_t len)
 {
-	if (!fDevice || !fOpen) {
+	if (!fDevice || !fOpen || fDevice->isInactive() ||
+	    (fInterface && fInterface->isInactive())) {
+		return -1;
+	}
+	if (fMaxFails > 0 && fConsecutiveFails >= fMaxFails) {
 		return -1;
 	}
 
@@ -406,7 +419,8 @@ int RtwnUsb::controlIn(uint8_t bRequest, uint16_t wValue, void *data, uint32_t l
 		return 0;
 	}
 	fInFail++;
-	fConsecutiveFails++;
+	if (fConsecutiveFails < fMaxFails)
+		fConsecutiveFails++;
 	trace(r == -2 ? "ctrl-IN-TIMEOUT" : "ctrl-IN-gagal");
 	return r;
 }
@@ -414,7 +428,11 @@ int RtwnUsb::controlIn(uint8_t bRequest, uint16_t wValue, void *data, uint32_t l
 int RtwnUsb::controlOut(uint8_t bRequest, uint16_t wValue, const void *data,
     uint32_t len)
 {
-	if (!fDevice || !fOpen) {
+	if (!fDevice || !fOpen || fDevice->isInactive() ||
+	    (fInterface && fInterface->isInactive())) {
+		return -1;
+	}
+	if (fMaxFails > 0 && fConsecutiveFails >= fMaxFails) {
 		return -1;
 	}
 
@@ -426,7 +444,8 @@ int RtwnUsb::controlOut(uint8_t bRequest, uint16_t wValue, const void *data,
 		return 0;
 	}
 	fOutFail++;
-	fConsecutiveFails++;
+	if (fConsecutiveFails < fMaxFails)
+		fConsecutiveFails++;
 	trace(r == -2 ? "ctrl-OUT-TIMEOUT" : "ctrl-OUT-gagal");
 	return r;
 }
@@ -599,7 +618,7 @@ void RtwnUsb::bulkRelease(void *param)
 
 bool RtwnUsb::bulkOpen(IOUSBHostInterface *interface, bool clearPipes)
 {
-	if (!interface || !fOpen) {
+	if (!interface || !isDeviceAlive()) {
 		return false;
 	}
 
@@ -668,7 +687,7 @@ bool RtwnUsb::bulkOpen(IOUSBHostInterface *interface, bool clearPipes)
 	for (int i = 0; i < 3; i++) {
 		fPipeStalled[i] = false;
 	}
-	if (clearPipes) {
+	if (clearPipes && isDeviceAlive() && !isControlDead()) {
 		fPipeIn->clearStall(true);
 		for (int i = 0; i < fNumOut; i++) {
 			if (fPipeOutAll[i]) {

@@ -32,11 +32,11 @@
 
 /* ── helper ─────────────────────────────────────────────────────────── */
 
-static uint8_t
+static int
 wr8(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx, uint16_t reg, uint8_t v)
 {
 	(void)rd;
-	return (uint8_t)wr(ctx, reg, &v, 1);
+	return wr(ctx, reg, &v, 1);
 }
 
 static int
@@ -72,11 +72,15 @@ rtwn_init_mac_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
 {
 	size_t i;
 	int n = 0;
+	int consec_err = 0;
 
 	for (i = 0; i < nitems(rtl8188eu_mac); i++) {
 		if (wr8(rd, wr, ctx, rtl8188eu_mac[i].reg,
 		    rtl8188eu_mac[i].val) == 0) {
 			n++;
+			consec_err = 0;
+		} else if (++consec_err >= 3) {
+			return -1;
 		}
 	}
 
@@ -85,7 +89,9 @@ rtwn_init_mac_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
 	 * EnableSingleAmpduorNot di RtWlanU.kext @0x40da0 dan kapasitas
 	 * TXPKTBUF 20 KB pada RQPN 0x8090000c).
 	 */
-	wr8(rd, wr, ctx, R92C_MAX_AGGR_NUM, 0x0a);
+	if (wr8(rd, wr, ctx, R92C_MAX_AGGR_NUM, 0x0a) != 0) {
+		return -1;
+	}
 
 	return n;
 }
@@ -117,9 +123,13 @@ rtwn_init_bb_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx, uint8_t xtal)
 	    R92C_SYS_FUNC_EN_BB_GLB_RST | R92C_SYS_FUNC_EN_BBRSTB));
 
 	/* Tabel BB (4 byte per register). */
+	int consec_err = 0;
 	for (i = 0; i < (size_t)prog->count; i++) {
 		if (wr32(rd, wr, ctx, prog->regs[i], prog->vals[i]) == 0) {
 			n++;
+			consec_err = 0;
+		} else if (++consec_err >= 3) {
+			return -1;
 		}
 		RTWN_DELAY_US(1);
 	}
@@ -129,6 +139,9 @@ rtwn_init_bb_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx, uint8_t xtal)
 		if (wr32(rd, wr, ctx, R92C_OFDM0_AGCRSSITABLE,
 		    prog->agcvals[i]) == 0) {
 			n++;
+			consec_err = 0;
+		} else if (++consec_err >= 3) {
+			return -1;
 		}
 		RTWN_DELAY_US(1);
 	}
@@ -192,6 +205,7 @@ rtwn_init_rf_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
 	RTWN_DELAY_US(10);
 
 	/* Tabel RF chain 0. */
+	int consec_err = 0;
 	for (j = 0; j < (size_t)prog->count; j++) {
 		addr = prog->regs[j];
 		switch (addr) {
@@ -221,6 +235,9 @@ rtwn_init_rf_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
 		if (rtwn_rf_write_8188e(rd, wr, ctx, 0, addr,
 		    prog->vals[j]) == 0) {
 			n++;
+			consec_err = 0;
+		} else if (++consec_err >= 3) {
+			return -1;
 		}
 		RTWN_DELAY_US(5);
 	}
@@ -404,7 +421,9 @@ rtwn_core_config_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
 	wr8(rd, wr, ctx, R92C_HWSEQ_CTRL, 0xff);
 
 	/* Buka semua antrean TX. */
-	wr8(rd, wr, ctx, R92C_TXPAUSE, 0x00);
+	if (wr8(rd, wr, ctx, R92C_TXPAUSE, 0x00) != 0) {
+		return -1;
+	}
 
 	/* TX report (AMRR / diagnostik). */
 	if (rd(ctx, R88E_TX_RPT_CTRL, &m, 1) == 0) {

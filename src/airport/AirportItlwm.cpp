@@ -1347,17 +1347,24 @@ setPOWER(OSObject *object,
         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & IFF_RUNNING) != 0;
         if (pd->power_state[0] == 0) {
             fHalService->get80211Controller()->ic_wcl_mac_reconfig = false;
+            power_state = 0;
             changePowerStateToPriv(kPowerStateOff);
             if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) {
                 net80211_ifstats(fHalService->get80211Controller());
                 disableAdapter(bsdInterface);
             }
         } else {
+            power_state = pd->power_state[0];
             changePowerStateToPriv(kPowerStateOn);
-            if (!isRunning)
-                enableAdapter(bsdInterface);
+            if (!isRunning) {
+                IOReturn st = enableAdapter(bsdInterface);
+                if (st != kIOReturnSuccess) {
+                    power_state = 0;
+                    pmPowerState = kPowerStateOff;
+                    return st;
+                }
+            }
         }
-        power_state = (pd->power_state[0]);
     }
 
     return kIOReturnSuccess;
@@ -1503,8 +1510,9 @@ IOReturn AirportItlwm::setPowerState(unsigned long powerStateOrdinal, IOService 
 {
     IOReturn result = IOPMAckImplied;
 
-    if (pmPowerState == powerStateOrdinal)
+    if (targetPowerState == powerStateOrdinal && pmPowerState == powerStateOrdinal)
         return result;
+    targetPowerState = (UInt32)powerStateOrdinal;
     switch (powerStateOrdinal) {
         case kPowerStateOff:
             if (powerOffThreadCall) {
@@ -1576,6 +1584,7 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
     IOReturn ret;
 
     pmPowerState = kPowerStateOn;
+    targetPowerState = kPowerStateOn;
     pmPolicyMaker = policyMaker;
 
     powerOffThreadCall = thread_call_allocate(
@@ -1593,6 +1602,10 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
 void AirportItlwm::setPowerStateOff()
 {
     XYLog("%s\n", __FUNCTION__);
+    if (targetPowerState != kPowerStateOff) {
+        pmPolicyMaker->acknowledgeSetPowerState();
+        return;
+    }
     pmPowerState = kPowerStateOff;
     disableAdapter(bsdInterface);
     pmPolicyMaker->acknowledgeSetPowerState();
@@ -1601,8 +1614,17 @@ void AirportItlwm::setPowerStateOff()
 void AirportItlwm::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);
+    if (targetPowerState != kPowerStateOn) {
+        pmPolicyMaker->acknowledgeSetPowerState();
+        return;
+    }
+    if (power_state) {
+        if (enableAdapter(bsdInterface) != kIOReturnSuccess) {
+            pmPowerState = kPowerStateOff;
+            pmPolicyMaker->acknowledgeSetPowerState();
+            return;
+        }
+    }
     pmPowerState = kPowerStateOn;
-    if (power_state)
-        enableAdapter(bsdInterface);
     pmPolicyMaker->acknowledgeSetPowerState();
 }

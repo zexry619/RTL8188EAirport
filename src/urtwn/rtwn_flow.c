@@ -172,17 +172,30 @@ static int rtwn_run_flow(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
 
 		switch (cmd) {
 		case RTWN_FLOW_WRITE: {
-			uint8_t v = rtwn_seq_raw_read1(rd, wr, ctx, reg);
+			uint8_t v = 0;
+			if (!rd || !wr || rd(ctx, reg, &v, 1) != 0) {
+				return -1;
+			}
 			uint8_t nv = (uint8_t)((~andm & v) | (orm & andm));
-			rtwn_seq_raw_write1(rd, wr, ctx, reg, nv);
+			if (wr(ctx, reg, &nv, 1) != 0) {
+				return -1;
+			}
 			break;
 		}
 		case RTWN_FLOW_POLL: {
 			uint8_t want = (uint8_t)(orm & andm);
+			int io_errs = 0;
 			for (;;) {
-				uint8_t v = rtwn_seq_raw_read1(rd, wr, ctx, reg);
-				if ((uint8_t)(v & andm) == want) {
-					break;
+				uint8_t v = 0;
+				if (!rd || rd(ctx, reg, &v, 1) != 0) {
+					if (++io_errs >= 3) {
+						return -1;
+					}
+				} else {
+					io_errs = 0;
+					if ((uint8_t)(v & andm) == want) {
+						break;
+					}
 				}
 				if (waited >= poll_timeout_ms) {
 					return -1;
@@ -250,6 +263,28 @@ int rtwn_flow_card_enable_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx)
  * page_count = jumlah halaman TX (OpenBSD: R88E_TX_PAGE_COUNT = 168).
  * total      = 0xAF (175) atau 0xFF (255) untuk tipe chip tertentu.
  */
+static int llt_wr4(rtwn_write_fn wr, void *ctx, uint16_t addr, uint32_t val)
+{
+	uint8_t b[4];
+	if (!wr) {
+		return -1;
+	}
+	b[0] = (uint8_t)(val & 0xff);
+	b[1] = (uint8_t)((val >> 8) & 0xff);
+	b[2] = (uint8_t)((val >> 16) & 0xff);
+	b[3] = (uint8_t)((val >> 24) & 0xff);
+	return wr(ctx, addr, b, 4);
+}
+
+static int llt_rd4(rtwn_read_fn rd, void *ctx, uint16_t addr)
+{
+	uint8_t b[4];
+	if (!rd) {
+		return -1;
+	}
+	return rd(ctx, addr, b, 4);
+}
+
 int rtwn_llt_init_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
     uint32_t page_count)
 {
@@ -258,25 +293,33 @@ int rtwn_llt_init_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
 
 	for (i = 1; i < page_count; i++) {
 		uint32_t v = (i & 0xff) | ((i - 1) << 8) | 0x40000000;
-		rtwn_seq_raw_write4(rd, wr, ctx, 0x1e0, v);
-		(void)rtwn_seq_raw_read4(rd, wr, ctx, 0x1e0, &v);
+		if (llt_wr4(wr, ctx, 0x1e0, v) != 0 ||
+		    llt_rd4(rd, ctx, 0x1e0) != 0) {
+			return -1;
+		}
 	}
 	{
 		uint32_t v = ((page_count - 1) & 0xff) << 8 | 0x400000ff;
-		rtwn_seq_raw_write4(rd, wr, ctx, 0x1e0, v);
-		(void)rtwn_seq_raw_read4(rd, wr, ctx, 0x1e0, &v);
+		if (llt_wr4(wr, ctx, 0x1e0, v) != 0 ||
+		    llt_rd4(rd, ctx, 0x1e0) != 0) {
+			return -1;
+		}
 	}
 
 	/* Sisa halaman (page_count..total-1) → rantai melingkar i -> i+1 (InitLLTTable8188E @0xae1ee). */
 	for (i = page_count, j = page_count << 8; i < total; i++, j += 0x100) {
 		uint32_t v = ((i + 1) & 0xff) | (j & 0xff00) | 0x40000000;
-		rtwn_seq_raw_write4(rd, wr, ctx, 0x1e0, v);
-		(void)rtwn_seq_raw_read4(rd, wr, ctx, 0x1e0, &v);
+		if (llt_wr4(wr, ctx, 0x1e0, v) != 0 ||
+		    llt_rd4(rd, ctx, 0x1e0) != 0) {
+			return -1;
+		}
 	}
 	{
 		uint32_t v = (page_count & 0xff) | (total << 8) | 0x40000000;
-		rtwn_seq_raw_write4(rd, wr, ctx, 0x1e0, v);
-		(void)rtwn_seq_raw_read4(rd, wr, ctx, 0x1e0, &v);
+		if (llt_wr4(wr, ctx, 0x1e0, v) != 0 ||
+		    llt_rd4(rd, ctx, 0x1e0) != 0) {
+			return -1;
+		}
 	}
 	return 0;
 }

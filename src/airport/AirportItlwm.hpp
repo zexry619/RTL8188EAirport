@@ -254,6 +254,7 @@ public:
     thread_call_t powerOffThreadCall;
     thread_call_t linkStateThreadCall;
     UInt32 pmPowerState;
+    UInt32 targetPowerState;
     IOService *pmPolicyMaker;
     UInt8 pmPCICapPtr;
     bool magicPacketEnabled;

@@ -109,6 +109,13 @@ public:
 	void detach();
 
 	bool isOpen() const { return fOpen; }
+	bool isDeviceAlive() const {
+		return fAttached && fOpen && fDevice && !fDevice->isInactive() &&
+		       (!fInterface || !fInterface->isInactive());
+	}
+	bool isControlDead() const {
+		return fMaxFails > 0 && fConsecutiveFails >= fMaxFails;
+	}
 
 	/* Penghitung transfer ( diagnostik). */
 	uint32_t inOk() const { return fInOk; }
