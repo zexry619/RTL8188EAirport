@@ -245,6 +245,10 @@ rtwn_set_chan_bw_8188e(rtwn_read_fn rd, rtwn_write_fn wr, void *ctx,
 		rtwn_seq_raw_write1(rd, wr, ctx, R92C_BWOPMODE,
 		    (uint8_t)(v8 | R92C_BWOPMODE_20MHZ));
 
+		v8 = rtwn_seq_raw_read1(rd, wr, ctx, R92C_RRSR_HI);
+		rtwn_seq_raw_write1(rd, wr, ctx, R92C_RRSR_HI,
+		    (uint8_t)(v8 & ~0x60));
+
 		/* 2. matikan flag 40 MHz di FPGA RFMOD */
 		v = rtwn_bb_read(rd, wr, ctx, R92C_FPGA0_RFMOD);
 		rtwn_bb_write(rd, wr, ctx, R92C_FPGA0_RFMOD,

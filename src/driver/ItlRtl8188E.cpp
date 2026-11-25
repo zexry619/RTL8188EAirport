@@ -1113,7 +1113,7 @@ int ItlRtl8188E::newstateCb(struct ieee80211com *ic,
 		}
 		if (ic->ic_bss) {
 			struct ieee80211_node *ni = ic->ic_bss;
-			if (ni->ni_chan)
+			if (ni->ni_chan && nstate != IEEE80211_S_RUN)
 				me->setChannel(ni->ni_chan);
 			uint32_t b0 = (uint32_t)ni->ni_bssid[0] |
 			    ((uint32_t)ni->ni_bssid[1] << 8) |
@@ -1189,6 +1189,15 @@ int ItlRtl8188E::newstateCb(struct ieee80211com *ic,
 	}
 
 	error = me->fOrigNewstate ? me->fOrigNewstate(ic, nstate, arg) : 0;
+	/*
+	 * Setel ulang kanal SETELAH fOrigNewstate() mengubah ic_state menjadi
+	 * IEEE80211_S_RUN agar setChannel() benar-benar mengaktifkan HT40 (40 MHz)
+	 * ketika AP menegosiasikan IEEE80211_CHAN_WIDTH_40.
+	 */
+	if (error == 0 && nstate == IEEE80211_S_RUN && ic->ic_bss &&
+	    ic->ic_bss->ni_chan) {
+		me->setChannel(ic->ic_bss->ni_chan);
+	}
 	return error;
 }
 
@@ -1935,8 +1944,10 @@ rxSlotOk(const uint8_t *buf, uint32_t len, uint32_t off)
 		return false;
 	dw3 = rxDescDw(buf, off, 3);
 	rpt_sel = (uint8_t)((dw3 >> 14) & 0x03);
+	if (rpt_sel == 1)
+		return info.pktlen == 8 && info.infosz == 0;
 	if (rpt_sel != 0)
-		return false;
+		return info.pktlen > 0 && info.pktlen <= 512 && info.infosz == 0;
 	if (info.infosz > 32)
 		return false;
 	if (info.pktlen < sizeof(struct ieee80211_frame_min) ||
@@ -2036,26 +2047,23 @@ void ItlRtl8188E::handleRx(const uint8_t *buf, uint32_t len, struct mbuf_list *m
 
 		/*
 		 * Pada RTL8188E USB aggregation (RXDMA_AGG_EN, OpenBSD if_urtwn.c
-		 * align=127), subframe berada pada kelipatan 128-byte (s128), bukan
-		 * 8-byte (s8) kecuali DMA agg khusus. Periksa s128 lebih dulu lalu s8/s4,
-		 * dan jangan lanjutkan bila slot saat ini berupa report (rpt_sel != 0).
+		 * align=127), subframe (termasuk CCX_RPT rpt_sel=1) berada pada
+		 * kelipatan 128-byte (s128). Jangan hentikan loop saat rpt_sel != 0
+		 * karena frame data 802.11 yang diagregasi di belakang CCX_RPT akan
+		 * ikut terbuang dan memicu TCP packet loss.
 		 */
-		if (rpt_sel != 0) {
+		rawLen = RTWN_USB_RX_DESC_SIZE + info.infosz + info.shift + flen;
+		s4 = (rawLen + 3) & ~3u;
+		s8 = (rawLen + 7) & ~7u;
+		s128 = (rawLen + 127) & ~127u;
+		if (rxSlotOk(buf, len, off + s128))
+			next = off + s128;
+		else if (rxSlotOk(buf, len, off + s8))
+			next = off + s8;
+		else if (rxSlotOk(buf, len, off + s4))
+			next = off + s4;
+		else
 			next = 0;
-		} else {
-			rawLen = RTWN_USB_RX_DESC_SIZE + info.infosz + info.shift + flen;
-			s4 = (rawLen + 3) & ~3u;
-			s8 = (rawLen + 7) & ~7u;
-			s128 = (rawLen + 127) & ~127u;
-			if (rxSlotOk(buf, len, off + s128))
-				next = off + s128;
-			else if (rxSlotOk(buf, len, off + s8))
-				next = off + s8;
-			else if (rxSlotOk(buf, len, off + s4))
-				next = off + s4;
-			else
-				next = 0;
-		}
 
 		if (!txReport) {
 			uint8_t type, sub;
